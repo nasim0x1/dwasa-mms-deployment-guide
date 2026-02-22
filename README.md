@@ -9,14 +9,9 @@
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Prerequisites](#2-prerequisites)
-3. [Server Preparation](#3-server-preparation)
-4. [Oracle Database Setup](#4-oracle-database-setup)
-5. [Backend (Spring Boot) Deployment](#5-backend-spring-boot-deployment)
-6. [Frontend (Vue.js) Build & Deployment](#6-frontend-vuejs-build--deployment)
-7. [Nginx Configuration](#7-nginx-configuration)
-8. [Firewall & SELinux](#8-firewall--selinux)
-9. [Verification & Troubleshooting](#9-verification--troubleshooting)
+2. [Step 1 — Install all tools](#2-step-1--install-all-tools)
+3. [Step 2 — Apply configuration](#3-step-2--apply-configuration)
+4. [Verification & troubleshooting](#4-verification--troubleshooting)
 
 ---
 
@@ -29,43 +24,23 @@
 | Database        | Oracle 19c        | 1521 | (existing/remote)       |
 | Reverse proxy   | Nginx             | 80   | `nginx`                 |
 
-**Assumptions:**
-
-- Oracle Linux 8.8 is freshly installed with root/sudo access.
-- Oracle Database 19c is either on the same server or reachable (host, port, service name, user, password known).
-- You have the built artifacts: `wasa-backend.jar`, `application.properties`, and the Vue production build (e.g. `wasa-app/dist/` or similar).
+**Assumptions:** Oracle Linux 8.8 with root/sudo; Oracle 19c reachable; built artifacts (`wasa-backend.jar`, `application.properties`, Vue `dist/`) ready.
 
 ---
 
-## 2. Prerequisites
+## 2. Step 1 — Install all tools
 
-- **OS:** Oracle Linux 8.8 (or compatible RHEL 8.x)
-- **Java:** OpenJDK 17 or Oracle JDK 17 (for running the JAR only on server)
-- **Node.js:** v14.19.3+ (only needed on build machine for `npm run build`)
-- **Maven:** Not required if the project has Maven Wrapper (`mvnw` / `mvnw.cmd`); use `./mvnw` (Linux/macOS) or `.\mvnw.cmd` (Windows) to build.
-- **Oracle Database:** 19c installed and running; schema created for the application
-- **Network:** Server IP/hostname and DNS (e.g. `meter.dhakawasa.org`) pointing to this server
+Do these in order on the **server**. Install every required tool and open firewall ports before configuring the application.
 
----
-
-## 3. Server Preparation
-
-### 3.1 Update system
+### 2.1 Update system
 
 ```bash
 sudo dnf update -y
 ```
 
-### 3.2 Create application user (for running the JAR)
+### 2.2 Install Java 17
 
 ```bash
-sudo useradd -r -s /bin/false springbootapp
-```
-
-### 3.3 Install Java 17
-
-```bash
-# Oracle Linux / RHEL 8
 sudo dnf install -y java-17-openjdk java-17-openjdk-devel
 
 # Verify
@@ -73,7 +48,20 @@ java -version
 # Should show: openjdk version "17.x.x"
 ```
 
-### 3.4 Create directory structure
+### 2.3 Install Nginx
+
+```bash
+sudo dnf install -y nginx
+sudo systemctl enable nginx
+```
+
+### 2.4 Create application user (for running the JAR)
+
+```bash
+sudo useradd -r -s /bin/false springbootapp
+```
+
+### 2.5 Create directory structure
 
 ```bash
 # Backend
@@ -83,75 +71,150 @@ sudo mkdir -p /opt/wasa-mms/uploads
 # Frontend
 sudo mkdir -p /var/www/wasa-app
 
-# Ownership for backend (application user)
+# Ownership for backend
 sudo chown -R springbootapp:springbootapp /opt/wasa-mms
 ```
 
----
+### 2.6 Open firewall ports
 
-## 4. Oracle Database Setup
+```bash
+sudo firewall-cmd --permanent --add-port=80/tcp
+sudo firewall-cmd --permanent --add-port=9090/tcp
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
 
-- Ensure Oracle 19c is installed and the listener is running.
-- Create a dedicated schema/user for MMS and note:
-  - **Host**
-  - **Port** (default 1521)
-  - **Service name** (e.g. `ORCL`, `XEPDB1`)
-  - **Username**
-  - **Password**
-
-Use these values in `application.properties` (see next section). No extra steps on the app server are needed if the DB is remote; only network connectivity and firewall (port 1521 if DB is on another host) are required.
+*(If the backend is only reached via Nginx on the same host, you can skip opening 9090 and only allow 80.)*
 
 ---
 
-## 5. Backend (Spring Boot) Deployment
+## 3. Step 2 — Apply configuration
 
-### 5.0 Build the backend (on build machine)
+After all tools are installed, apply configuration and deploy the application.
 
-From the backend project root (where `pom.xml` and `mvnw` are). **Java 17** is required. The project uses **Maven Wrapper** (`mvnw`), so you do not need to install Maven.
+### 3.1 Oracle Database (create user, permissions, quota, then export/import)
 
-**Linux / macOS:**
+*Assume Oracle 19c is already installed and the pluggable database exists. Run as the Oracle OS user (e.g. `oracle`) or with SYSDBA.*
 
-```bash
-# Navigate to backend project root
-cd /path/to/wasa-backend
+#### 1. Create OS directory for dump files
 
-# Build JAR (skip tests for faster build; remove -DskipTests to run tests)
-./mvnw clean package -DskipTests
-
-# Output JAR location
-# target/wasa-backend.jar
-```
-
-**Windows (PowerShell or CMD):**
+On the database server:
 
 ```bash
-cd \path\to\wasa-backend
-.\mvnw.cmd clean package -DskipTests
+sudo mkdir -p /home/oracle/exp_dir
+sudo chown oracle:oinstall /home/oracle/exp_dir
 ```
 
-To run tests during build:
+#### 2. Create new DB user (schema)
 
 ```bash
-./mvnw clean package          # Linux/macOS
-.\mvnw.cmd clean package      # Windows
+sqlplus / as sysdba
 ```
 
-The built JAR will be at **`target/wasa-backend.jar`**. Copy `src/main/resources/application.properties` to the server as well (or create it on the server).
+In SQL*Plus:
 
-### 5.1 Copy backend files to server
+```sql
+-- Switch to pluggable database (e.g. WASADB)
+ALTER SESSION SET CONTAINER = WASADB;
 
-From your build machine, copy to the server (replace `USER` and `SERVER`):
+-- Create new user (schema)
+CREATE USER WASA_MMS_LIVE IDENTIFIED BY WasaMeetingX;
+```
+
+#### 3. Grant import/export permissions
+
+Still in SQL*Plus:
+
+```sql
+-- Allow Data Pump import (needed to load from DMP)
+GRANT IMP_FULL_DATABASE TO WASA_MMS_LIVE;
+
+-- Allow Data Pump export (if this user will export; optional)
+GRANT EXP_FULL_DATABASE TO WASA_MMS_LIVE;
+
+-- Connect and resource for normal use
+GRANT CONNECT, RESOURCE TO WASA_MMS_LIVE;
+```
+
+#### 4. Set quota (tablespace space)
+
+```sql
+ALTER USER WASA_MMS_LIVE QUOTA UNLIMITED ON USERS;
+```
+
+#### 5. Create directory object and grant read/write for Data Pump
+
+```sql
+CREATE OR REPLACE DIRECTORY exp_dir AS '/home/oracle/exp_dir';
+GRANT READ, WRITE ON DIRECTORY exp_dir TO WASA_MMS_LIVE;
+```
+
+Use **Host**, **Port** (1521), **Service name** (e.g. `WASADB`), **Username** (`WASA_MMS_LIVE`), **Password** (`WasaMeetingX`) in `application.properties`.
+
+---
+
+#### Export command (expdp)
+
+Run on the **source** server. Place the DMP in the path that `exp_dir` points to (e.g. `/home/oracle/exp_dir/`). Replace `SPRING_USER2` and password with the source schema.
+
+```bash
+expdp SPRING_USER2/<source_password>@//localhost:1521/WASADB \
+  DIRECTORY=exp_dir \
+  DUMPFILE=WASA_MMS_MASTER_FINAL.DMP \
+  LOGFILE=export_log.log \
+  SCHEMAS=SPRING_USER2
+```
+
+Full database export (privileged user):
+
+```bash
+expdp system/<password>@//localhost:1521/WASADB \
+  DIRECTORY=exp_dir \
+  DUMPFILE=full_backup.DMP \
+  LOGFILE=export_log.log \
+  FULL=Y
+```
+
+Copy the DMP to the target server under the same path used by `exp_dir` (e.g. `/home/oracle/exp_dir/`).
+
+#### Import command (impdp)
+
+Place the DMP in the directory that `exp_dir` points to (e.g. `/home/oracle/exp_dir/WASA_MMS_MASTER_FINAL.DMP`). Then run:
+
+```bash
+impdp WASA_MMS_LIVE/WasaMeetingX@//localhost:1521/WASADB \
+  DIRECTORY=exp_dir \
+  DUMPFILE=WASA_MMS_MASTER_FINAL.DMP \
+  LOGFILE=import_log.log \
+  REMAP_SCHEMA=SPRING_USER2:WASA_MMS_LIVE \
+  TABLE_EXISTS_ACTION=REPLACE
+```
+
+- **REMAP_SCHEMA=source:target** — objects from dump schema go into the user you created.
+- **TABLE_EXISTS_ACTION=REPLACE** — replace existing tables (or use `SKIP` / `APPEND`).
+
+For remote DB, use `//HOST:PORT/SERVICE_NAME` instead of `//localhost:1521/WASADB`.
+
+---
+
+### 3.2 Backend (Spring Boot)
+
+**Build (on your build machine):** From backend project root (Java 17 + Maven Wrapper):
+
+```bash
+./mvnw clean package -DskipTests          # Linux/macOS
+.\mvnw.cmd clean package -DskipTests      # Windows
+# Output: target/wasa-backend.jar
+```
+
+**Copy to server:**
 
 ```bash
 scp target/wasa-backend.jar USER@SERVER:/opt/wasa-mms/
 scp src/main/resources/application.properties USER@SERVER:/opt/wasa-mms/
 ```
 
-Or use rsync/sftp as per your policy.
-
-### 5.2 Configure application.properties on server
-
-Edit on the server:
+**Configure `application.properties` on server:**
 
 ```bash
 sudo nano /opt/wasa-mms/application.properties
@@ -159,28 +222,26 @@ sudo nano /opt/wasa-mms/application.properties
 
 Set at least:
 
-- **Oracle URL:**  
-  `spring.datasource.url=jdbc:oracle:thin:@//HOST:PORT/SERVICE_NAME`  
-  Example: `jdbc:oracle:thin:@//192.168.115.50:1521/ORCL`
-- **Username:** `spring.datasource.username=your_db_user`
-- **Password:** `spring.datasource.password=your_db_password`
-- **Server port (optional):** `server.port=9090`
-- **Upload path (if used):** e.g. `file.upload-dir=/opt/wasa-mms/uploads`
+- `spring.datasource.url=jdbc:oracle:thin:@//HOST:PORT/SERVICE_NAME`
+- `spring.datasource.username=your_db_user`
+- `spring.datasource.password=your_db_password`
+- `server.port=9090` (optional)
+- `file.upload-dir=/opt/wasa-mms/uploads` (if used)
 
-Save and secure the file:
+Then:
 
 ```bash
 sudo chown springbootapp:springbootapp /opt/wasa-mms/application.properties
 sudo chmod 600 /opt/wasa-mms/application.properties
 ```
 
-### 5.3 Create systemd service
+**Create and start systemd service:**
 
 ```bash
 sudo nano /etc/systemd/system/wasa-mms.service
 ```
 
-Paste (adjust paths if different):
+Paste:
 
 ```ini
 [Unit]
@@ -201,8 +262,6 @@ SyslogIdentifier=wasa-mms
 WantedBy=multi-user.target
 ```
 
-Enable and start:
-
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable wasa-mms
@@ -210,82 +269,39 @@ sudo systemctl start wasa-mms
 sudo systemctl status wasa-mms
 ```
 
-Check logs:
-
-```bash
-sudo journalctl -u wasa-mms -f
-```
-
 ---
 
-## 6. Frontend (Vue.js) Build & Deployment
+### 3.3 Frontend (Vue.js)
 
-### 6.0 Build the frontend (on build machine)
-
-On a machine with **Node.js v14.19.3+** installed:
+**Build (on build machine):** Set API URL in `wasa-app/src/config/api_config.js`, then:
 
 ```bash
-# Navigate to Vue project directory
 cd /path/to/wasa-app
-
-# Install dependencies
 npm install
-
-# Production build (output goes to dist/ by default)
 npm run build
 ```
 
-**Output:** Production files are in **`dist/`** (or the `outputDir` set in `vue.config.js`). Deploy the *contents* of this folder to the server.
+**Deploy to server:** Copy contents of `dist/` to `/var/www/wasa-app/`:
 
-**Before building:** Set the production API URL in `wasa-app/src/config/api_config.js`, e.g.:
-
-```javascript
-export const authServiceBaseUrl = 'http://192.168.115.51:9090/api/'
-// Or, if using Nginx proxy: export const authServiceBaseUrl = '/api/'
+```bash
+rsync -avz dist/ USER@SERVER:/var/www/wasa-app/
+# or: scp -r dist/* USER@SERVER:/var/www/wasa-app/
 ```
 
-### 6.1 Deploy build to server
-
-Copy the **contents** of the build output (usually `dist/`) to the server:
-
-   ```bash
-   rsync -avz dist/ USER@SERVER:/var/www/wasa-app/
-   # or
-   scp -r dist/* USER@SERVER:/var/www/wasa-app/
-   ```
-
-### 6.2 Set ownership and permissions on server
+**Permissions and SELinux on server:**
 
 ```bash
 sudo chown -R nginx:nginx /var/www/wasa-app/
 sudo find /var/www/wasa-app/ -type d -exec chmod 755 {} \;
 sudo find /var/www/wasa-app/ -type f -exec chmod 644 {} \;
-```
-
-If SELinux is enabled (default on Oracle Linux 8):
-
-```bash
 sudo chcon -Rt httpd_sys_content_t /var/www/wasa-app/
-```
-
-Restart Nginx after any change:
-
-```bash
-sudo systemctl restart nginx
 ```
 
 ---
 
-## 7. Nginx Configuration
+### 3.4 Nginx configuration
 
-### 7.1 Install Nginx
-
-```bash
-sudo dnf install -y nginx
-sudo systemctl enable nginx
-```
-
-### 7.2 Create site configuration
+Create the site config:
 
 ```bash
 sudo nano /etc/nginx/conf.d/wasa.conf
@@ -312,9 +328,7 @@ server {
 }
 ```
 
-**Optional — proxy API to backend (same origin, no CORS):**
-
-If you prefer the frontend to call `/api/` on the same host instead of `http://IP:9090/api/`, add inside the same `server` block:
+**Optional — proxy API (same origin):** Add inside the same `server` block:
 
 ```nginx
     location /api/ {
@@ -328,121 +342,76 @@ If you prefer the frontend to call `/api/` on the same host instead of `http://I
 
 Then in `api_config.js` use: `export const authServiceBaseUrl = '/api/'`
 
-### 7.3 Test and reload Nginx
+**Test and start Nginx:**
 
 ```bash
 sudo nginx -t
-sudo systemctl restart nginx
+sudo systemctl start nginx
+# or if already running: sudo systemctl restart nginx
 ```
 
 ---
 
-## 8. Firewall & SELinux
-
-### 8.1 Firewall (firewalld)
+### 3.5 SELinux (if enabled)
 
 ```bash
-sudo firewall-cmd --permanent --add-port=80/tcp
-sudo firewall-cmd --permanent --add-port=9090/tcp
-sudo firewall-cmd --reload
-sudo firewall-cmd --list-ports
+# Frontend (usually done above)
+sudo chcon -Rt httpd_sys_content_t /var/www/wasa-app/
+
+# Uploads (if Nginx serves /uploads/)
+sudo chcon -Rt httpd_sys_content_t /opt/wasa-mms/uploads/
+
+# If Nginx proxy to backend fails
+sudo setsebool -P httpd_can_network_connect 1
 ```
-
-If the backend is only used via Nginx proxy on the same host, you can omit opening 9090 publicly and only allow 80.
-
-### 8.2 SELinux
-
-- Frontend directory must be readable by Nginx (already done above):
-
-  ```bash
-  sudo chcon -Rt httpd_sys_content_t /var/www/wasa-app/
-  ```
-
-- If Nginx serves files from `/opt/wasa-mms/uploads/`, allow read access:
-
-  ```bash
-  sudo chcon -Rt httpd_sys_content_t /opt/wasa-mms/uploads/
-  ```
-
-- If you use `proxy_pass` to 9090 and see permission errors, check:
-
-  ```bash
-  sudo setsebool -P httpd_can_network_connect 1
-  ```
 
 ---
 
-## 9. Verification & Troubleshooting
+## 4. Verification & troubleshooting
 
-### 9.1 Backend
+**Backend:**
 
 ```bash
-# Service status
 sudo systemctl status wasa-mms
-
-# Logs
-sudo journalctl -u wasa-mms -n 100 --no-pager
-
-# Test API (from server)
+sudo journalctl -u wasa-mms -f
 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9090/api/
-# Expect 200 or 401, not connection refused
 ```
 
-### 9.2 Frontend & Nginx
+**Nginx & frontend:**
 
 ```bash
-# Nginx status
 sudo systemctl status nginx
-
-# Test config
 sudo nginx -t
-
-# Test from server
 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/
-# Expect 200
 ```
 
-### 9.3 From browser
-
-- Open `http://192.168.115.51` or `http://meter.dhakawasa.org`.
-- Confirm login and that API calls work (Network tab: requests to `/api/` or `:9090/api/` succeed).
-
-### 9.4 Common issues
+**Browser:** Open `http://192.168.115.51` or `http://meter.dhakawasa.org` and check login and API calls.
 
 | Issue | Check |
 |-------|--------|
-| 502 Bad Gateway | Backend not running or wrong `proxy_pass` port; `journalctl -u wasa-mms` |
-| 403 Forbidden on static files | Permissions and SELinux: `chown nginx:nginx`, `chcon httpd_sys_content_t` |
-| API connection refused | Firewall, backend listening on 9090, correct URL in `api_config.js` |
-| Blank page / wrong route | Nginx `try_files ... /index.html` and correct `root` |
-| Uploads not found | `location /uploads/` alias path and SELinux on `/opt/wasa-mms/uploads/` |
+| 502 Bad Gateway | Backend not running; `journalctl -u wasa-mms` |
+| 403 on static files | `chown nginx:nginx`, `chcon httpd_sys_content_t` |
+| API refused | Firewall, backend on 9090, correct URL in `api_config.js` |
+| Blank page | Nginx `try_files ... /index.html`, correct `root` |
+| Uploads not found | `location /uploads/` alias, SELinux on `/opt/wasa-mms/uploads/` |
 
 ---
 
-## Quick reference — commands summary
+## Quick reference
 
 ```bash
 # Backend
-sudo systemctl start wasa-mms
-sudo systemctl stop wasa-mms
 sudo systemctl restart wasa-mms
 sudo journalctl -u wasa-mms -f
 
-# Frontend permissions after deploy
+# Frontend after deploy
 sudo chown -R nginx:nginx /var/www/wasa-app/
 sudo find /var/www/wasa-app/ -type d -exec chmod 755 {} \;
 sudo find /var/www/wasa-app/ -type f -exec chmod 644 {} \;
 sudo chcon -Rt httpd_sys_content_t /var/www/wasa-app/
 sudo systemctl restart nginx
-
-# Firewall
-sudo firewall-cmd --permanent --add-port=80/tcp
-sudo firewall-cmd --permanent --add-port=9090/tcp
-sudo firewall-cmd --reload
 ```
 
 ---
 
-**Document version:** 1.0  
-**Target:** Oracle Linux 8.8  
-**Last updated:** February 2025
+**Document version:** 1.0 · **Target:** Oracle Linux 8.8 · **Last updated:** February 2026
